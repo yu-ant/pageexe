@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+import zipfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -66,6 +67,81 @@ class FileTests(unittest.TestCase):
                                  ["img0.JPG", "img1.JPG"])
                 remaining = len(splitter.scan_folder(self.src))
                 self.assertEqual(remaining, 0 if move else 5)
+
+
+class FlattenTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.src = self.tmp.name
+        make(self.src, "top.jpg", 5)
+        for d in ("a", os.path.join("a", "deep"), "b"):
+            os.makedirs(os.path.join(self.src, d), exist_ok=True)
+        make(os.path.join(self.src, "a"), "same.jpg", 10)
+        make(os.path.join(self.src, "b"), "same.jpg", 20)
+        make(os.path.join(self.src, "a", "deep"), "x.png", 30)
+        make(os.path.join(self.src, "b"), "memo.txt", 1)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_scan_skips_top_level_and_non_images(self):
+        names = sorted(os.path.basename(i.path) for i in splitter.scan_subfolders(self.src))
+        self.assertEqual(names, ["same.jpg", "same.jpg", "x.png"])
+
+    def test_move_flatten_renames_duplicates_and_cleans(self):
+        items = splitter.scan_subfolders(self.src)
+        self.assertEqual(splitter.flatten(items, self.src, move=True), 3)
+        top = sorted(os.listdir(self.src))
+        self.assertIn("same.jpg", top)
+        self.assertIn("same (1).jpg", top)
+        self.assertIn("x.png", top)
+        # b에는 memo.txt가 남아 있으므로 b는 남고, a와 a/deep은 지워진다
+        self.assertEqual(splitter.remove_empty_dirs(self.src), 2)
+        self.assertTrue(os.path.isdir(os.path.join(self.src, "b")))
+        self.assertFalse(os.path.exists(os.path.join(self.src, "a")))
+
+    def test_copy_flatten_keeps_originals(self):
+        items = splitter.scan_subfolders(self.src)
+        splitter.flatten(items, self.src, move=False)
+        self.assertEqual(len(splitter.scan_subfolders(self.src)), 3)
+
+
+class ZipTests(unittest.TestCase):
+    def test_zip_groups_stay_under_limit(self):
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as out:
+            for i in range(20):
+                make(src, f"사진_{i:02d}.jpg", 1000 + i * 37)
+            items = splitter.sort_files(splitter.scan_folder(src))
+            limit = 6000
+            groups = splitter.plan_groups(items, limit, for_zip=True)
+            done = splitter.execute_zip(groups, out, "p")
+            self.assertEqual(done, 20)
+            zips = sorted(os.listdir(out))
+            self.assertEqual(len(zips), len(groups))
+            count = 0
+            for z in zips:
+                path = os.path.join(out, z)
+                self.assertLessEqual(os.path.getsize(path), limit)
+                with zipfile.ZipFile(path) as zf:
+                    self.assertIsNone(zf.testzip())
+                    count += len(zf.namelist())
+            self.assertEqual(count, 20)
+            self.assertEqual(len(os.listdir(src)), 20)  # 원본 유지
+
+    def test_zip_stop_removes_partial(self):
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as out:
+            for i in range(4):
+                make(src, f"{i}.jpg", 100)
+            groups = splitter.plan_groups(splitter.scan_folder(src), 10 ** 6, for_zip=True)
+            calls = []
+
+            def stop():
+                calls.append(1)
+                return len(calls) > 2
+
+            done = splitter.execute_zip(groups, out, "p", should_stop=stop)
+            self.assertEqual(done, 0)
+            self.assertEqual(os.listdir(out), [])
 
 
 if __name__ == "__main__":
